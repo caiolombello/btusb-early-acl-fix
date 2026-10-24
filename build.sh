@@ -9,7 +9,8 @@
 #    upstream tag (kernel.org, GitHub mirror as fallback).
 # 2. Builds that source unmodified and compares it with the distro's own btusb
 #    module, so a distro-patched or mismatched source is never installed.
-# 3. Applies patches/btusb-early-acl-hold.patch and builds the module.
+# 3. Applies the first patch in patches/ that fits the source exactly and builds
+#    the module (the btusb code changed between kernel versions).
 #
 # Optional settings in /etc/btusb-early-acl.conf:
 #   SOURCE_TAG=v7.2.11   force the upstream tag to download
@@ -81,7 +82,11 @@ rm -rf src stock patched btusb.ko stock-installed.ko
 mkdir -p src stock patched
 
 log "kernel $KVER, upstream source $TAG"
-fetch drivers/bluetooth/btusb.c src/btusb.c
+if ! (fetch drivers/bluetooth/btusb.c src/btusb.c) 2> /dev/null; then
+	(fetch drivers/bluetooth/btusb_main.c src/btusb_main.c) 2> /dev/null &&
+		die "btusb is split into several files in $TAG (Linux 7.4+); this version of the fix does not support it yet"
+	die "could not download drivers/bluetooth/btusb.c for $TAG"
+fi
 sed -n 's/^#include "\([^"/]*\.h\)"$/\1/p' src/btusb.c > src/headers.list
 while read -r header; do
 	fetch "drivers/bluetooth/$header" "src/$header"
@@ -119,8 +124,16 @@ fi
 
 # DKMS refuses to replace an in-tree module that has the same version string.
 sed -i 's/^#define VERSION "\([^"]*\)"$/#define VERSION "\1.1-earlyacl"/' patched/btusb.c
-patch -d patched -p3 -s --no-backup-if-mismatch < "$HERE/patches/btusb-early-acl-hold.patch" ||
-	die "the patch does not apply to $TAG btusb.c; look for an updated version of this fix"
+PATCH=""
+for candidate in "$HERE"/patches/*.patch; do
+	if patch -d patched -p3 -F0 -s -f --dry-run < "$candidate" > /dev/null 2>&1; then
+		PATCH=$candidate
+		break
+	fi
+done
+[ -n "$PATCH" ] || die "no patch in patches/ applies to $TAG btusb.c; look for an updated version of this fix"
+patch -d patched -p3 -F0 -s --no-backup-if-mismatch < "$PATCH"
+log "applied $(basename "$PATCH")"
 build_in "$HERE/patched"
 modinfo -F parm patched/btusb.ko | grep -q '^early_acl_hold_ms:' || die "patched module lacks early_acl_hold_ms"
 cp patched/btusb.ko "$HERE/btusb.ko"
