@@ -1,0 +1,166 @@
+btusb: hold ACL data that arrives before its connection handle is known
+
+Some USB controllers (seen on Realtek RTL8852BU, 0bda:b85b) deliver the first
+ACL packet of a new LE link on the bulk endpoint 4-12 ms before the LE
+Connection Complete event arrives on the interrupt endpoint. hci_core then
+drops it ("ACL packet for unknown connection handle"). When that packet is the
+peer's ATT Exchange MTU Request, the peer never gets a response and stops
+sending input after the 30 s ATT transaction timeout (e.g. Keychron M6 8K).
+
+Hold such packets in btusb (at most early_acl_hold_ms, default 50) until the
+core has registered the handle, keeping packet order under rxlock.
+
+Applies to drivers/bluetooth/btusb.c (tested on Linux 7.2.11).
+
+--- a/drivers/bluetooth/btusb.c
++++ b/drivers/bluetooth/btusb.c
+@@ -36,6 +36,7 @@
+ static bool enable_autosuspend = IS_ENABLED(CONFIG_BT_HCIBTUSB_AUTOSUSPEND);
+ static bool enable_poll_sync = IS_ENABLED(CONFIG_BT_HCIBTUSB_POLL_SYNC);
+ static bool reset = true;
++static unsigned int early_acl_hold_ms = 50;
+ 
+ static struct usb_driver btusb_driver;
+ 
+@@ -1008,6 +1009,7 @@
+ 	struct delayed_work rx_work;
+ 
+ 	struct sk_buff_head acl_q;
++	struct sk_buff *acl_held;	/* acl_q head held for an unknown handle */
+ 
+ 	struct usb_anchor deferred;
+ 	struct usb_anchor tx_anchor;
+@@ -1349,14 +1351,40 @@
+ 	return err;
+ }
+ 
++/* Some controllers (e.g. Realtek RTL8852BU) send the first ACL packet of a
++ * new LE link on the bulk endpoint a few ms before the Connection Complete
++ * event arrives on the interrupt endpoint. The core then drops it as
++ * "ACL packet for unknown connection handle". When that packet is the peer's
++ * ATT Exchange MTU Request, the peer never gets a response and its ATT bearer
++ * stops after the 30 s transaction timeout. Hold such packets briefly until
++ * the core knows the handle.
++ */
++static bool btusb_acl_handle_unknown(struct btusb_data *data,
++				     struct sk_buff *skb)
++{
++	u16 handle;
++
++	if (!READ_ONCE(early_acl_hold_ms) || skb->len < HCI_ACL_HDR_SIZE)
++		return false;
++
++	handle = hci_handle(__le16_to_cpu(hci_acl_hdr(skb)->handle));
++
++	return !hci_conn_hash_lookup_handle(data->hdev, handle);
++}
++
++/* Called with rxlock held */
+ static int btusb_recv_acl(struct btusb_data *data, struct sk_buff *skb)
+ {
+-	/* Only queue ACL packet if intr_interval is set as it means
+-	 * force_poll_sync has been enabled.
++	/* Deliver directly unless force_poll_sync is enabled (intr_interval
++	 * set), older packets are still queued, or the handle is not known
++	 * yet. Checking the queue under rxlock keeps packets in order.
+ 	 */
+-	if (!data->intr_interval)
++	if (!data->intr_interval && skb_queue_empty(&data->acl_q) &&
++	    !btusb_acl_handle_unknown(data, skb))
+ 		return data->recv_acl(data->hdev, skb);
+ 
++	/* Arrival time; hci_recv_frame() overwrites it on delivery */
++	skb->tstamp = ktime_get();
+ 	skb_queue_tail(&data->acl_q, skb);
+ 	schedule_delayed_work(&data->rx_work, data->intr_interval);
+ 
+@@ -2518,15 +2546,76 @@
+ 	usb_autopm_put_interface(data->intf);
+ }
+ 
++/* Next ACL packet to deliver, or NULL if acl_q is empty or its head is held
++ * for a handle the core does not know yet. Called with rxlock held.
++ */
++static struct sk_buff *btusb_acl_dequeue(struct btusb_data *data)
++{
++	unsigned int hold_ms = READ_ONCE(early_acl_hold_ms);
++	struct sk_buff *skb;
++	bool unknown, held;
++	s64 age_ms;
++
++	spin_lock(&data->acl_q.lock);
++
++	skb = skb_peek(&data->acl_q);
++	if (!skb)
++		goto unlock;
++
++	unknown = hold_ms && btusb_acl_handle_unknown(data, skb);
++	age_ms = ktime_ms_delta(ktime_get(), skb->tstamp);
++
++	if (unknown && age_ms < hold_ms) {
++		/* Poll until the core processes the Connection Complete */
++		data->acl_held = skb;
++		schedule_delayed_work(&data->rx_work, 1);
++		skb = NULL;
++		goto unlock;
++	}
++
++	__skb_unlink(skb, &data->acl_q);
++
++unlock:
++	spin_unlock(&data->acl_q.lock);
++
++	if (!skb)
++		return NULL;
++
++	/* Pointer comparison only; acl_held is never dereferenced */
++	held = skb == data->acl_held;
++	if (held)
++		data->acl_held = NULL;
++
++	if (unknown)
++		bt_dev_warn_ratelimited(data->hdev,
++			"Early ACL for unknown handle %u not claimed after %lld ms",
++			hci_handle(__le16_to_cpu(hci_acl_hdr(skb)->handle)),
++			age_ms);
++	else if (held)
++		bt_dev_info(data->hdev,
++			    "Delivered early ACL for handle %u after %lld ms",
++			    hci_handle(__le16_to_cpu(hci_acl_hdr(skb)->handle)),
++			    age_ms);
++
++	return skb;
++}
++
+ static void btusb_rx_work(struct work_struct *work)
+ {
+ 	struct btusb_data *data = container_of(work, struct btusb_data,
+ 					       rx_work.work);
+ 	struct sk_buff *skb;
++	unsigned long flags;
++
++	/* rxlock stops btusb_recv_acl() from delivering newer packets
++	 * directly while queued ones are being delivered here.
++	 */
++	spin_lock_irqsave(&data->rxlock, flags);
+ 
+-	/* Dequeue ACL data received during the interval */
+-	while ((skb = skb_dequeue(&data->acl_q)))
++	while ((skb = btusb_acl_dequeue(data)))
+ 		data->recv_acl(data->hdev, skb);
++
++	spin_unlock_irqrestore(&data->rxlock, flags);
+ }
+ 
+ static int btusb_setup_bcm92035(struct hci_dev *hdev)
+@@ -4836,6 +4925,10 @@
+ module_param(reset, bool, 0644);
+ MODULE_PARM_DESC(reset, "Send HCI reset command on initialization");
+ 
++module_param(early_acl_hold_ms, uint, 0644);
++MODULE_PARM_DESC(early_acl_hold_ms,
++		 "Max ms to hold ACL data that arrives before its connection handle is known (0 = off)");
++
+ MODULE_AUTHOR("Marcel Holtmann <marcel@holtmann.org>");
+ MODULE_DESCRIPTION("Generic Bluetooth USB driver ver " VERSION);
+ MODULE_VERSION(VERSION);

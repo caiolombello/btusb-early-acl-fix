@@ -1,0 +1,6 @@
+# Created when build.sh runs inside the repository
+/src/
+/stock/
+/patched/
+/btusb.ko
+/stock-installed.ko

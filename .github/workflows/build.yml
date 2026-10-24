@@ -1,0 +1,46 @@
+name: Build
+
+# Checks that the patch still applies and builds against the newest Fedora kernel,
+# and that the downloaded upstream source matches Fedora's own btusb module.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '23 7 * * 1'   # weekly, to catch new kernels
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - run: shellcheck build.sh install.sh uninstall.sh diagnose.sh
+
+  fedora:
+    if: github.event_name != 'schedule' || github.repository == 'caiolombello/btusb-early-acl-fix'
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Install the newest kernel-devel and the matching stock modules
+        run: |
+          dnf -y -q install --setopt=install_weak_deps=False \
+            kernel-devel gcc make binutils patch curl xz elfutils-libelf-devel diffutils
+          KVER=$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel-devel | sort -V | tail -1)
+          dnf -y -q install --setopt=tsflags=noscripts --setopt=install_weak_deps=False \
+            "kernel-modules-${KVER%.*}"
+          echo "KVER=$KVER" >> "$GITHUB_ENV"
+      - name: Verify the source and build the patched module
+        run: |
+          mkdir -p /tmp/build && cp -r . /tmp/build && cd /tmp/build
+          bash ./build.sh "$KVER" "/usr/src/kernels/$KVER"
+          modinfo -F version btusb.ko
+          modinfo -F parm btusb.ko | grep early_acl_hold_ms
