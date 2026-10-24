@@ -66,7 +66,9 @@ fi
 # Also prepare any newer kernel that is installed but not booted yet.
 for dir in /lib/modules/*/; do
 	kv=$(basename "$dir")
-	[ "$kv" != "$KVER" ] && [ -d "$dir/build" ] || continue
+	if [ "$kv" = "$KVER" ] || [ ! -d "$dir/build" ]; then
+		continue
+	fi
 	[ "$(printf '%s\n%s\n' "$KVER" "$kv" | sort -V | tail -1)" = "$kv" ] || continue
 	log "Building for installed kernel $kv"
 	dkms install -m "$NAME" -v "$VERSION" -k "$kv" || echo "Warning: build for $kv failed; it will use the stock driver."
