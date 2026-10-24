@@ -50,12 +50,13 @@ done
 for added in $(dkms status -m "$NAME" 2>/dev/null | sed -n "s|^$NAME/\([^,: ]*\).*|\1|p" | sort -u); do
 	log "Removing $NAME/$added from DKMS"
 	dkms remove -m "$NAME" -v "$added" --all || true
+	rm -rf "/usr/src/$NAME-$added"
 done
 rm -rf "/usr/src/$NAME-$VERSION"
 install -d "/usr/src/$NAME-$VERSION/patches"
 install -m 0644 dkms.conf "/usr/src/$NAME-$VERSION/"
 install -m 0755 build.sh "/usr/src/$NAME-$VERSION/"
-install -m 0644 patches/btusb-early-acl-hold.patch "/usr/src/$NAME-$VERSION/patches/"
+install -m 0644 patches/*.patch "/usr/src/$NAME-$VERSION/patches/"
 
 log "Building for kernel $KVER"
 dkms add -m "$NAME" -v "$VERSION"

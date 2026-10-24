@@ -36,7 +36,7 @@ This is not a BlueZ bug: BlueZ never receives the dropped packet.
 
 ## What the fix does
 
-The patch (`patches/btusb-early-acl-hold.patch`, about 90 lines) changes `btusb` so that a data packet whose connection handle is not registered yet is held for at most 50 ms and delivered right after the kernel processes the Connection Complete event. Packet order is preserved. Packets for known connections are not affected. Each saved packet is logged:
+The patch (about 90 lines, in `patches/`) changes `btusb` so that a data packet whose connection handle is not registered yet is held for at most 50 ms and delivered right after the kernel processes the Connection Complete event. Packet order is preserved. Packets for known connections are not affected. Each saved packet is logged:
 
 ```
 Bluetooth: hci0: Delivered early ACL for handle 16 after 4 ms
@@ -47,6 +47,9 @@ Bluetooth: hci0: Delivered early ACL for handle 16 after 4 ms
 | Distro | Kernel | Adapter | Device | Result |
 |---|---|---|---|---|
 | Fedora 44 | 7.2.11-200.fc44 | Realtek RTL8852BU (`0bda:b85b`), firmware 0x127cfd78 | Keychron M6 8K | Works: 9+ minutes with idle periods, reconnects after power cycling, full HID descriptor with stock BlueZ 5.87 |
+| Fedora rawhide | 7.3.0-65.fc46 | — | — | Builds; source check exact. Not tested on hardware |
+
+Supported kernel layouts: Linux up to 7.2 (`btusb-early-acl-hold.patch`) and 7.3 (`btusb-early-acl-hold-v7.3.patch`). Linux 7.4 splits `btusb.c` into several files and is not supported yet; the build stops with a clear message and the stock driver stays in use.
 
 The same race has been reported upstream on the Intel Wireless-AC 9260 (`8087:0025`) and an Edimax adapter (`7392:c611`). This fix has not been tested on them; reports are welcome.
 
@@ -66,7 +69,7 @@ For each kernel the build:
 
 1. downloads `drivers/bluetooth/btusb.c` for the matching upstream version from kernel.org (GitHub mirror as fallback);
 2. builds it **unmodified** and compares the result with your distro's own `btusb` module;
-3. only then applies the patch and builds the fixed module.
+3. only then applies the patch that matches that source exactly and builds the fixed module.
 
 If the source does not match your distro's driver (for example, a distro that patches `btusb`), nothing is installed and the stock driver stays in use. On Fedora the comparison is exact: the rebuilt stock driver is instruction-for-instruction identical to Fedora's.
 
